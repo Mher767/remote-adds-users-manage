@@ -1,0 +1,74 @@
+# Path to folder with .env files
+$EnvFolderPath = "C:\Manage-users\env"
+
+# List of remote servers and domains
+$DomainServers = @(
+    @{ Server = "DC1.local.test.am"; Domain = "local.test.am" },
+    @{ Server = "DC.dotest.local"; Domain = "dotest.local" }
+)
+
+# Input the username and new password
+$UserToReset = Read-Host "Enter the username (SamAccountName) of the user to reset the password"
+$NewPassword = Read-Host "Enter the new password for the user" -AsSecureString
+
+# Script logic
+foreach ($DomainServer in $DomainServers) {
+    $RemoteServer = $DomainServer.Server
+    $Domain = $DomainServer.Domain
+    $EnvFilePath = Join-Path -Path $EnvFolderPath -ChildPath "$Domain.env"
+
+    Write-Output "Processing server $RemoteServer for domain $Domain..."
+
+    # Load admin credentials from .env file
+    if (Test-Path $EnvFilePath) {
+        $EnvContent = Get-Content $EnvFilePath | ForEach-Object {
+            $Key, $Value = $_ -split '=', 2
+            [PSCustomObject]@{ Key = $Key; Value = $Value.Trim() }
+        }
+
+        $AdminUsername = ($EnvContent | Where-Object { $_.Key -eq "AdminUsername" }).Value
+        $AdminPassword = ($EnvContent | Where-Object { $_.Key -eq "AdminPassword" }).Value | ConvertTo-SecureString -AsPlainText -Force
+        $Credential = New-Object System.Management.Automation.PSCredential ($AdminUsername, $AdminPassword)
+
+        # Define the Distinguished Name for the domain
+        $DomainPath = "DC=$($Domain -replace '\.', ',DC=')"
+
+        try {
+            # Create a PowerShell session on the remote server
+            $Session = New-PSSession -ComputerName $RemoteServer -Credential $Credential -Authentication Negotiate
+
+            # Execute commands in the remote session
+            Invoke-Command -Session $Session -ScriptBlock {
+                param (
+                    $UserToReset,
+                    $NewPassword,
+                    $Domain
+                )
+
+                Import-Module ActiveDirectory
+
+                # Find the user
+                $User = Get-ADUser -Filter {SamAccountName -eq $UserToReset} -ErrorAction SilentlyContinue
+
+                if ($null -ne $User) {
+                    # Reset the user's password
+                    Set-ADAccountPassword -Identity $User -NewPassword $NewPassword -Reset
+                    Write-Output "Password for user '$UserToReset' has been successfully reset in domain $Domain."
+                } else {
+                    Write-Output "User '$UserToReset' does not exist in domain $Domain."
+                }
+            } -ArgumentList $UserToReset, $NewPassword, $Domain
+
+            # Close the session
+            Remove-PSSession $Session
+
+        } catch {
+            Write-Error "Failed to process server $RemoteServer for domain $Domain. Error: $_"
+        }
+
+    } else {
+        Write-Error "Environment file for domain $Domain not found at $EnvFilePath."
+    }
+}
+
+Write-Output "Script execution completed."
