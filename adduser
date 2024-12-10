@@ -1,0 +1,99 @@
+# Path to folder with .env files
+$EnvFolderPath = "C:\Manage-users\env"
+
+# Input parameters
+$DomainServers = @(
+    @{ Server = "DC1.local.test.am"; Domain = "local.test.am" },
+    @{ Server = "DC.dotest.local"; Domain = "dotest.local" }
+)
+
+$NewUserName = Read-Host "Enter the new user's login"
+$NewUserPassword = Read-Host "Enter the new user's password" -AsSecureString
+$OUName = "doit"  # Name of the organizational unit
+$GroupsToAdd = @("Domain Admins", "Remote Desktop Users")  # Groups to add the new user to
+
+# Script logic
+foreach ($DomainServer in $DomainServers) {
+    $RemoteServer = $DomainServer.Server
+    $Domain = $DomainServer.Domain
+    $EnvFilePath = Join-Path -Path $EnvFolderPath -ChildPath "$Domain.env"
+
+    Write-Output "Processing server $RemoteServer for domain $Domain..."
+
+    # Load admin credentials from .env file
+    if (Test-Path $EnvFilePath) {
+        $EnvContent = Get-Content $EnvFilePath | ForEach-Object {
+            $Key, $Value = $_ -split '=', 2
+            [PSCustomObject]@{ Key = $Key; Value = $Value.Trim() }
+        }
+
+        $AdminUsername = ($EnvContent | Where-Object { $_.Key -eq "AdminUsername" }).Value
+        $AdminPassword = ($EnvContent | Where-Object { $_.Key -eq "AdminPassword" }).Value | ConvertTo-SecureString -AsPlainText -Force
+        $Credential = New-Object System.Management.Automation.PSCredential ($AdminUsername, $AdminPassword)
+
+        # Define the Distinguished Name for the OU
+        $DomainPath = "DC=$($Domain -replace '\.', ',DC=')"
+        $OU = "OU=$OUName,$DomainPath"
+
+        try {
+            # Create a remote PowerShell session
+            $Session = New-PSSession -ComputerName $RemoteServer -Credential $Credential -Authentication Negotiate
+
+            # Run commands on the remote server
+            Invoke-Command -Session $Session -ScriptBlock {
+                param (
+                    $OU,
+                    $OUName,
+                    $DomainPath,
+                    $NewUserName,
+                    $NewUserPassword,
+                    $GroupsToAdd,
+                    $Domain
+                )
+
+                Import-Module ActiveDirectory
+
+                # Ensure the OU exists
+                if (-not (Get-ADOrganizationalUnit -Filter {DistinguishedName -eq $OU} -ErrorAction SilentlyContinue)) {
+                    New-ADOrganizationalUnit -Name $OUName -Path $DomainPath
+                    Write-Output "Organizational Unit '$OUName' has been successfully created in domain $Domain."
+                } else {
+                    Write-Output "Organizational Unit '$OUName' already exists in domain $Domain."
+                }
+
+                # Ensure the user does not already exist
+                if (Get-ADUser -Filter {SamAccountName -eq $NewUserName} -ErrorAction SilentlyContinue) {
+                    Write-Output "A user with the login $NewUserName already exists in domain $Domain."
+                } else {
+                    # Create the new user
+                    New-ADUser -Name $NewUserName `
+                               -SamAccountName $NewUserName `
+                               -UserPrincipalName "$NewUserName@$Domain" `
+                               -AccountPassword $NewUserPassword `
+                               -Path $OU `
+                               -Enabled $true `
+                               -PasswordNeverExpires $false
+
+                    Write-Output "User $NewUserName has been successfully created in the '$OUName' Organizational Unit for domain $Domain."
+
+                    # Add the user to the specified groups
+                    foreach ($Group in $GroupsToAdd) {
+                        Add-ADGroupMember -Identity $Group -Members $NewUserName
+                        Write-Output "$NewUserName has been added to the '$Group' group."
+                    }
+                }
+            } -ArgumentList $OU, $OUName, $DomainPath, $NewUserName, $NewUserPassword, $GroupsToAdd, $Domain
+
+            # Close the session
+            Remove-PSSession $Session
+
+        } catch {
+            Write-Error "Failed to process server $RemoteServer for domain $Domain. Error: $_"
+        }
+
+    } else {
+        Write-Error "Environment file for domain $Domain not found at $EnvFilePath."
+    }
+}
+
+Write-Output "Script execution completed."
