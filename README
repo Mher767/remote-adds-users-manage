@@ -1,0 +1,4 @@
+create env files
+
+    $Domain = $DomainServer.Domain
+    $EnvFilePath = Join-Path -Path $EnvFolderPath -ChildPath "$Domain.env"
